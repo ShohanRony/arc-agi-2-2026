@@ -3,17 +3,29 @@
 No external imports beyond stdlib (json/collections/pathlib) since Kaggle eval runs offline.
 Mirrors src/dsl.py + src/search.py logic inline so this one file is the whole submission.
 
-Adjust CHALLENGES_PATH below once dataset is attached in Kaggle (check the competition's
-Data tab for the exact input filename, typically .../arc-agi_test_challenges.json).
+CHALLENGES_PATH is auto-discovered under /kaggle/input (the exact mount directory name isn't
+guaranteed to match the competition slug - first real run hit a FileNotFoundError from a wrong
+guess here, so search for the filename instead of hardcoding the full path).
 """
 import json
 from collections import Counter
 from pathlib import Path
 
-CHALLENGES_PATH = "/kaggle/input/arc-prize-2026-arc-agi-2/arc-agi_test_challenges.json"
+CHALLENGES_FILENAME = "arc-agi_test_challenges.json"
 OUTPUT_PATH = "/kaggle/working/submission.json"
 MAX_FACTOR = 4
 MAX_DEPTH = 2
+
+
+def find_challenges_path():
+    matches = list(Path("/kaggle/input").rglob(CHALLENGES_FILENAME))
+    if not matches:
+        available = list(Path("/kaggle/input").rglob("*"))
+        raise FileNotFoundError(
+            f"{CHALLENGES_FILENAME} not found under /kaggle/input. "
+            f"Contents: {[str(p) for p in available]}"
+        )
+    return matches[0]
 
 
 # ---- DSL primitives (Grid = tuple[tuple[int, ...], ...]) ----
@@ -162,7 +174,7 @@ def to_list(grid):
 
 
 def main():
-    challenges = json.loads(Path(CHALLENGES_PATH).read_text())
+    challenges = json.loads(find_challenges_path().read_text())
     submission = {}
     for task_id, task in challenges.items():
         train_pairs = [(to_grid(p["input"]), to_grid(p["output"])) for p in task["train"]]
