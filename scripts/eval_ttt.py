@@ -22,7 +22,7 @@ from src.serialize import format_completion, text_to_grid
 MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 N_TRAIN_AUGS = 12
 N_STEPS = 60
-N_TEST_AUGS = 5
+N_TEST_AUGS = 3
 MAX_NEW_TOKENS_CAP = 700
 LR = 1e-4
 
