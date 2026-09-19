@@ -1,13 +1,22 @@
-"""Train + calibrate the depth-2-worth-it ranker on dataset.csv.
+"""Train + calibrate the "is this task solvable by our DSL library at all" ranker on
+dataset.csv (all 1000 training tasks, not just the ones needing depth-2).
 
-Rows where needed_depth2==0 carry no signal for this decision (depth-1 already solved them,
-so the "expand to depth-2?" question never arises) - only needed_depth2==1 rows are used.
-Target: depth2_found (did the expensive combinatorial step actually pay off).
+First target tried was "does depth-2 expansion help" (needed_depth2==1 rows only): 9/976
+positive (0.9%) - too sparse, calibration was noise fit to the base rate, dropped. This
+target - solved at depth<=2, any depth - is 33/1000 (3.3%), workable, and gates a bigger
+compute cost: skipping the whole search (depth-1 and depth-2) on tasks predicted unlikely
+to be solvable, not just skipping depth-2.
 
 Two-stage fit so the final model is a portable (w, b, a, c) tuple, no sklearn needed at
 inference time: base logistic regression gives raw score z = w.x + b; a *separate* 1D
 Platt-scaling sigmoid p = sigmoid(a*z + c) is fit on a held-out calibration split (fitting
 it on the same rows as w,b would just relearn the identity and hide any real miscalibration).
+
+class_weight="balanced" on the base classifier matters here: at 3.3% positive rate, an
+unweighted fit just predicts the base rate everywhere (looks "calibrated" by ECE, but has
+zero ranking ability - mean AUC was ~0.5 that way). Balanced weighting recovers real signal
+(5-fold CV AUC ~0.94); the Platt step afterwards then re-calibrates those now-informative
+scores back into honest probabilities.
 """
 import csv
 import sys
@@ -15,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -29,10 +39,9 @@ def load_dataset():
     X, y = [], []
     with open(DATASET) as f:
         for row in csv.DictReader(f):
-            if int(row["needed_depth2"]) == 0:
-                continue
+            solved = int(row["needed_depth2"]) == 0 or int(row["depth2_found"]) == 1
             X.append([float(row[name]) for name in FEATURE_NAMES])
-            y.append(int(row["depth2_found"]))
+            y.append(int(solved))
     return np.array(X), np.array(y)
 
 
@@ -64,7 +73,7 @@ def main():
         X_rest, y_rest, test_size=0.5, random_state=0, stratify=y_rest
     )
 
-    base = LogisticRegression(max_iter=1000)
+    base = LogisticRegression(max_iter=1000, class_weight="balanced")
     base.fit(X_train, y_train)
 
     z_calib = base.decision_function(X_calib)
@@ -78,6 +87,8 @@ def main():
 
     raw_ece = expected_calibration_error(y_test, raw_probs)
     cal_ece = expected_calibration_error(y_test, cal_probs)
+    auc = roc_auc_score(y_test, z_test)
+    print(f"test-split AUC (ranking ability): {auc:.3f}")
     print(f"raw logistic regression ECE:  {raw_ece:.4f}")
     print(f"Platt-calibrated ECE:         {cal_ece:.4f}")
 
@@ -95,7 +106,7 @@ def main():
     # keep the Platt (a, c) fit above since it was already fit on a disjoint calibration split.
     X_fit = np.concatenate([X_train, X_calib])
     y_fit = np.concatenate([y_train, y_calib])
-    base_final = LogisticRegression(max_iter=1000)
+    base_final = LogisticRegression(max_iter=1000, class_weight="balanced")
     base_final.fit(X_fit, y_fit)
 
     np.savez(

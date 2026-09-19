@@ -1,7 +1,11 @@
 """Accuracy-vs-compute sweep on the held-out evaluation split (120 tasks, never seen by the
-ranker). Single pass computes depth-1 and (if needed) depth-2 once per task, records timing
-and the calibrated probability, then simulates every threshold analytically from that cache -
-so the sweep itself costs no extra search time.
+ranker). Gate is now BEFORE any search: skip depth-1 and depth-2 entirely on tasks the
+calibrated model rates unlikely to be solvable by our DSL library at all (previous version
+gated only the depth-2 step, which turned out to have no learnable signal - see git history).
+
+Single pass computes depth-1 and (if needed) depth-2 once per task, caching timing and the
+calibrated probability, then the threshold sweep is simulated analytically from that cache -
+no extra search time spent per threshold.
 """
 import sys
 import time
@@ -33,6 +37,8 @@ def main():
 
     rows = []
     for tid, task in tasks.items():
+        prob = calibrated_prob(np.array(extract(task["train"])), w, b, a, c)
+
         t0 = time.time()
         prog1 = find_program(task, max_depth=1)
         t_d1 = time.time() - t0
@@ -40,40 +46,37 @@ def main():
             apply_program(prog1, gin) == gout for gin, gout in task["test"]
         )
 
-        needs_d2 = prog1 is None
-        prob = calibrated_prob(np.array(extract(task["train"])), w, b, a, c) if needs_d2 else None
         t_d2 = 0.0
         solved_d2 = False
-        if needs_d2:
+        if prog1 is None:
             t0 = time.time()
             prog2 = find_program(task, max_depth=2)
             t_d2 = time.time() - t0
             solved_d2 = prog2 is not None and all(
                 apply_program(prog2, gin) == gout for gin, gout in task["test"]
             )
-        rows.append(dict(tid=tid, t_d1=t_d1, solved_d1=solved_d1, needs_d2=needs_d2,
-                          prob=prob, t_d2=t_d2, solved_d2=solved_d2))
+        rows.append(dict(tid=tid, prob=prob, t_search=t_d1 + t_d2,
+                          solved=solved_d1 or solved_d2))
 
     n = len(rows)
-    base_time = sum(r["t_d1"] for r in rows) + sum(r["t_d2"] for r in rows)
-    base_solved = sum(r["solved_d1"] or r["solved_d2"] for r in rows)
-    print(f"unrestricted (always expand to depth-2): solved {base_solved}/{n} "
-          f"({base_solved / n:.1%}), total search time {base_time:.1f}s")
+    base_time = sum(r["t_search"] for r in rows)
+    base_solved = sum(r["solved"] for r in rows)
+    print(f"unrestricted (always search): solved {base_solved}/{n} ({base_solved / n:.1%}), "
+          f"total search time {base_time:.1f}s")
 
-    print("\nthreshold  solved  solve_rate  total_time  time_saved_vs_unrestricted")
-    for tau in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]:
-        solved = 0
-        total_time = sum(r["t_d1"] for r in rows)
+    print("\nthreshold  tasks_searched  solved  solve_rate  total_time  time_saved")
+    for tau in [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.01]:
+        searched = solved = 0
+        total_time = 0.0
         for r in rows:
-            if r["solved_d1"]:
-                solved += 1
-                continue
-            if r["needs_d2"] and r["prob"] is not None and r["prob"] >= tau:
-                total_time += r["t_d2"]
-                if r["solved_d2"]:
+            if r["prob"] >= tau:
+                searched += 1
+                total_time += r["t_search"]
+                if r["solved"]:
                     solved += 1
         saved = 1 - total_time / base_time
-        print(f"{tau:9.2f}  {solved:6d}  {solved / n:9.1%}  {total_time:9.1f}s  {saved:22.1%}")
+        print(f"{tau:9.2f}  {searched:14d}  {solved:6d}  {solved / n:9.1%}  "
+              f"{total_time:9.1f}s  {saved:9.1%}")
 
 
 if __name__ == "__main__":
