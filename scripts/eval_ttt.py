@@ -4,10 +4,14 @@ task's train pairs only, then predict the real test output via test-time augment
 majority vote (several random augmented views of the test input, same trained adapter, de-augment
 each prediction, vote) instead of retraining per view.
 
-Base model is loaded ONCE and LoRA adapters are cycled (delete/add) per task rather than
-reloading the full ~1GB base model from scratch every task - the original per-task full-reload
-approach was implicated in repeated system-memory-pressure kills at --limit 15 (fine at
---limit 5/8), consistent with a slow leak across many from_pretrained() calls in one process.
+Tried loading the base model once and cycling LoRA adapters (delete_adapter/add_adapter)
+between tasks to avoid reloading ~1GB per task. That leaked real GPU memory that gc.collect()
++ torch.cuda.empty_cache() could not reclaim (13.84 GiB "allocated" on a 6GB card after 5
+tasks, then 16.25 GiB after the same 5 tasks on a second attempt with the cleanup added -
+something in peft keeps a live reference to deleted adapters). Reverted to a full per-task
+model reload, which never hit a CUDA OOM in any run - simpler and it's the one that's proven
+not to leak. The ~1-2s reload overhead is negligible next to per-task time (tens to hundreds
+of seconds).
 """
 import argparse
 import gc
@@ -71,28 +75,9 @@ def build_example(tokenizer, gin, gout, device):
     return input_ids, labels
 
 
-def build_model(tokenizer, device):
-    """Load the base model + a first LoRA adapter ONCE. Call reset_adapter() between tasks
-    instead of rebuilding this."""
+def fresh_lora_model(tokenizer, device):
     base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16).to(device)
     return get_peft_model(base, LORA_CFG, adapter_name=ADAPTER_NAME)
-
-
-def reset_adapter(model):
-    """Discard the previous task's trained LoRA weights and attach a freshly-initialized
-    adapter under the same name, without touching the (expensive, shared) base model.
-
-    delete_adapter() alone doesn't release the old adapter's CUDA memory promptly - a 15-task
-    run OOM'd on task 6 with PyTorch reporting more memory "allocated" than the 6GB card has,
-    classic sign of a per-task leak. gc.collect() before empty_cache() so any parameter tensors
-    only kept alive by a reference cycle (autograd graph, optimizer state) actually get dropped
-    before we ask the CUDA allocator to release its free blocks.
-    """
-    model.delete_adapter(ADAPTER_NAME)
-    model.add_adapter(ADAPTER_NAME, LORA_CFG)
-    model.set_adapter(ADAPTER_NAME)
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def train_on_task(model, tokenizer, train_pairs, test_input, device, rng):
@@ -144,11 +129,9 @@ def main():
     tasks = load_split(args.split)
     task_ids = list(tasks)[: args.limit]
 
-    model = build_model(tokenizer, device)
-
     solved = 0
     t0_all = time.time()
-    for i, tid in enumerate(task_ids):
+    for tid in task_ids:
         t0 = time.time()
         task = tasks[tid]
         train_pairs = task["train"]
@@ -158,8 +141,7 @@ def main():
         import random
         rng = random.Random(rng_seed)
 
-        if i > 0:
-            reset_adapter(model)
+        model = fresh_lora_model(tokenizer, device)
         task_solved = True
         train_time = predict_time = 0.0
         for test_gin, test_gout in task["test"]:
@@ -175,6 +157,9 @@ def main():
             attempt2 = top2[1] if len(top2) > 1 else attempt1
             if attempt1 != test_gout and attempt2 != test_gout:
                 task_solved = False
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
 
         if task_solved:
             solved += 1
