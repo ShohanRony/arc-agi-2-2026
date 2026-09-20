@@ -4,6 +4,7 @@ or something structurally wrong.
 """
 import random
 import sys
+import zlib
 from pathlib import Path
 
 import torch
@@ -12,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.augment import random_augmentation
 from src.data import load_split
 from src.serialize import format_completion, text_to_grid, grid_to_text
-from scripts.eval_ttt import fresh_lora_model, train_on_task, estimate_max_new_tokens
+from scripts.eval_ttt import build_model, train_on_task, estimate_max_new_tokens
 from transformers import AutoTokenizer
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B"
@@ -33,8 +34,8 @@ def main():
           f"true output {len(test_gout)}x{len(test_gout[0])}")
     print(f"true output:\n{grid_to_text(test_gout)}\n")
 
-    rng = random.Random(hash(task_id) & 0xFFFFFFFF)
-    model = fresh_lora_model(tokenizer, device)
+    rng = random.Random(zlib.crc32(task_id.encode()))
+    model = build_model(tokenizer, device)
     train_on_task(model, tokenizer, train_pairs, test_gin, device, rng)
 
     model.eval()

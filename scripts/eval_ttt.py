@@ -3,10 +3,16 @@ scripts/eval_baseline.py). Per task: fresh LoRA adapter, fine-tune on augmented 
 task's train pairs only, then predict the real test output via test-time augmentation +
 majority vote (several random augmented views of the test input, same trained adapter, de-augment
 each prediction, vote) instead of retraining per view.
+
+Base model is loaded ONCE and LoRA adapters are cycled (delete/add) per task rather than
+reloading the full ~1GB base model from scratch every task - the original per-task full-reload
+approach was implicated in repeated system-memory-pressure kills at --limit 15 (fine at
+--limit 5/8), consistent with a slow leak across many from_pretrained() calls in one process.
 """
 import argparse
 import sys
 import time
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -25,6 +31,11 @@ N_STEPS = 60
 N_TEST_AUGS = 3
 MAX_NEW_TOKENS_CAP = 700
 LR = 1e-4
+ADAPTER_NAME = "task"
+LORA_CFG = LoraConfig(
+    r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.0, task_type="CAUSAL_LM",
+)
 
 
 def estimate_max_new_tokens(train_pairs, test_shape):
@@ -59,13 +70,19 @@ def build_example(tokenizer, gin, gout, device):
     return input_ids, labels
 
 
-def fresh_lora_model(tokenizer, device):
+def build_model(tokenizer, device):
+    """Load the base model + a first LoRA adapter ONCE. Call reset_adapter() between tasks
+    instead of rebuilding this."""
     base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16).to(device)
-    lora_cfg = LoraConfig(
-        r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.0, task_type="CAUSAL_LM",
-    )
-    return get_peft_model(base, lora_cfg)
+    return get_peft_model(base, LORA_CFG, adapter_name=ADAPTER_NAME)
+
+
+def reset_adapter(model):
+    """Discard the previous task's trained LoRA weights and attach a freshly-initialized
+    adapter under the same name, without touching the (expensive, shared) base model."""
+    model.delete_adapter(ADAPTER_NAME)
+    model.add_adapter(ADAPTER_NAME, LORA_CFG)
+    model.set_adapter(ADAPTER_NAME)
 
 
 def train_on_task(model, tokenizer, train_pairs, test_input, device, rng):
@@ -117,17 +134,22 @@ def main():
     tasks = load_split(args.split)
     task_ids = list(tasks)[: args.limit]
 
+    model = build_model(tokenizer, device)
+
     solved = 0
     t0_all = time.time()
-    for tid in task_ids:
+    for i, tid in enumerate(task_ids):
         t0 = time.time()
         task = tasks[tid]
         train_pairs = task["train"]
-        rng_seed = hash(tid) & 0xFFFFFFFF
+        # zlib.crc32, not the builtin hash(): Python's str hash is randomized per-process by
+        # default, so "deterministic" seeding via hash(tid) silently changed every run.
+        rng_seed = zlib.crc32(tid.encode())
         import random
         rng = random.Random(rng_seed)
 
-        model = fresh_lora_model(tokenizer, device)
+        if i > 0:
+            reset_adapter(model)
         task_solved = True
         train_time = predict_time = 0.0
         for test_gin, test_gout in task["test"]:
@@ -143,8 +165,6 @@ def main():
             attempt2 = top2[1] if len(top2) > 1 else attempt1
             if attempt1 != test_gout and attempt2 != test_gout:
                 task_solved = False
-        del model
-        torch.cuda.empty_cache()
 
         if task_solved:
             solved += 1
