@@ -10,6 +10,7 @@ approach was implicated in repeated system-memory-pressure kills at --limit 15 (
 --limit 5/8), consistent with a slow leak across many from_pretrained() calls in one process.
 """
 import argparse
+import gc
 import sys
 import time
 import zlib
@@ -79,10 +80,19 @@ def build_model(tokenizer, device):
 
 def reset_adapter(model):
     """Discard the previous task's trained LoRA weights and attach a freshly-initialized
-    adapter under the same name, without touching the (expensive, shared) base model."""
+    adapter under the same name, without touching the (expensive, shared) base model.
+
+    delete_adapter() alone doesn't release the old adapter's CUDA memory promptly - a 15-task
+    run OOM'd on task 6 with PyTorch reporting more memory "allocated" than the 6GB card has,
+    classic sign of a per-task leak. gc.collect() before empty_cache() so any parameter tensors
+    only kept alive by a reference cycle (autograd graph, optimizer state) actually get dropped
+    before we ask the CUDA allocator to release its free blocks.
+    """
     model.delete_adapter(ADAPTER_NAME)
     model.add_adapter(ADAPTER_NAME, LORA_CFG)
     model.set_adapter(ADAPTER_NAME)
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def train_on_task(model, tokenizer, train_pairs, test_input, device, rng):
