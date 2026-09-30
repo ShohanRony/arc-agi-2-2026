@@ -142,15 +142,21 @@ def main():
         rng = random.Random(rng_seed)
 
         model = fresh_lora_model(tokenizer, device)
+        print(f"  [after model load] cuda allocated={torch.cuda.memory_allocated() / 1e9:.2f}GB "
+              f"reserved={torch.cuda.memory_reserved() / 1e9:.2f}GB")
         task_solved = True
         train_time = predict_time = 0.0
         for test_gin, test_gout in task["test"]:
             tt0 = time.time()
             train_on_task(model, tokenizer, train_pairs, test_gin, device, rng)
             train_time += time.time() - tt0
+            print(f"  [after train] cuda allocated={torch.cuda.memory_allocated() / 1e9:.2f}GB "
+                  f"reserved={torch.cuda.memory_reserved() / 1e9:.2f}GB")
             tp0 = time.time()
             preds = predict(model, tokenizer, train_pairs, test_gin, device, rng)
             predict_time += time.time() - tp0
+            print(f"  [after predict] cuda allocated={torch.cuda.memory_allocated() / 1e9:.2f}GB "
+                  f"reserved={torch.cuda.memory_reserved() / 1e9:.2f}GB")
             counts = Counter(preds)
             top2 = [g for g, _ in counts.most_common(2)]
             attempt1 = top2[0] if top2 else test_gin
@@ -160,6 +166,8 @@ def main():
         del model
         gc.collect()
         torch.cuda.empty_cache()
+        print(f"  [after cleanup] cuda allocated={torch.cuda.memory_allocated() / 1e9:.2f}GB "
+              f"reserved={torch.cuda.memory_reserved() / 1e9:.2f}GB")
 
         if task_solved:
             solved += 1
